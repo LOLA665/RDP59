@@ -1,0 +1,63 @@
+# Setări VM
+$vmName = "Win11-6oee"
+$vmMemoryGB = 64
+$vmDiskPath = "C:\HyperV\VirtualHardDisks\Win11-6oee.vhdx"
+$vmDiskSizeBytes = 1TB  # 1 terabyte in bytes
+$vmProcessorCount = 128
+$isoPath = "D:\ISOs\Win11_22H2_English_x64v2.iso" # Updateaza cu pathul tau la ISO Windows 11
+
+# Creare director pentru disc dacă nu există
+if (-not (Test-Path (Split-Path $vmDiskPath))) {
+    New-Item -ItemType Directory -Path (Split-Path $vmDiskPath) -Force
+}
+
+# Creează discul virtual 1 TB
+New-VHD -Path $vmDiskPath -SizeBytes 1TB -Dynamic
+
+# Creează VM-ul
+New-VM -Name $vmName -MemoryStartupBytes (${vmMemoryGB}GB) -Generation 2 -NewVHDPath $vmDiskPath
+
+# Setează procesor Intel (default de fapt, dar setăm numărul)
+Set-VMProcessor -VMName $vmName -Count $vmProcessorCount
+
+# Atașează ISO instalare Windows 11
+Add-VMDvdDrive -VMName $vmName -Path $isoPath
+
+# Configurează boot de pe DVD la primul boot
+Set-VMFirmware -VMName $vmName -BootOrder (Get-VMFirmware -VMName $vmName).BootOrder | Where-Object { $_.Device -eq "CD" }
+
+# Porneste VM
+Start-VM -Name $vmName
+
+Write-Output "Asteapta 5 minute pentru instalarea Windows... Acorda timp pentru instalare manuala."
+Start-Sleep -Seconds 300
+
+# Foloseste PowerShell Direct pentru a rula comenzi in VM (presupune Windows instalat si configurat PowerShell Direct)
+Invoke-Command -VMName $vmName -ScriptBlock {
+    # Instaleaza Tailscale
+    Invoke-WebRequest -Uri "https://tailscale.com/install.ps1" -UseBasicParsing | Invoke-Expression
+    tailscale up --authkey="YOUR_AUTH_KEY" --accept-routes
+
+    # Instaleaza RustDesk
+    Start-Process -FilePath "powershell.exe" -ArgumentList "winget install --id RustDesk.RustDesk -e -h" -Wait
+
+    # Configurare RustDesk cu parola permanenta (simplificat)
+    $confPath = "$env:APPDATA\RustDesk\rustdesk.conf"
+    Start-Sleep -Seconds 10
+    if (Test-Path $confPath) {
+        $configContent = Get-Content $confPath -Raw
+        $newContent = $configContent -replace '"password":".*"', '"password":"ParolaTare123"'
+        Set-Content -Path $confPath -Value $newContent
+    }
+
+    # Porneste RustDesk
+    Start-Process "C:\Program Files\RustDesk\rustdesk.exe"
+}
+
+# Ruleaza VM 6 ore (21600 secunde)
+Start-Sleep -Seconds 21600
+
+# Opreste VM-ul dupa 6 ore
+Stop-VM -Name $vmName -Force
+
+Write-Output "Workflow complet - VM oprit dupa 6 ore."
