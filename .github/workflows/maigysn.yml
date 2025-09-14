@@ -1,0 +1,117 @@
+name: Windows Server 2025 VM Setup with Tailscale and RDP
+
+on: [push]
+
+env:
+  VM_NAME: WinServer2025-Tailscale-RDP
+  VM_RAM: 64GB
+  VM_DISK: C:\HyperV\VirtualHardDisks\WinServer2025-Tailscale-RDP.vhdx
+  VM_DISK_SIZE_BYTES: 1TB
+  VM_CPU_COUNT: 8
+  VM_OS_ISO: C:\temp\WinServer2025_English_x64.iso
+  TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+jobs:
+  setup-vm:
+    runs-on: windows-latest
+    steps:
+      - name: Download Windows Server 2025 ISO with redirect handling
+        shell: powershell
+        run: |
+          $url = "https://software-download.microsoft.com/Windows_Server_2025_Eval_x64_EN-US.iso"
+          $outputPath = "$env:VM_OS_ISO"
+
+          function Invoke-WebRequestFollowRedirects {
+              param(
+                  [string]$Uri,
+                  [string]$OutFile,
+                  [int]$MaximumRedirection = 10
+              )
+              $currentUri = $Uri
+              for ($i=0; $i -lt $MaximumRedirection; $i++) {
+                  $response = Invoke-WebRequest -Uri $currentUri -Method Head -MaximumRedirection 0 -ErrorAction Stop
+                  if ($response.StatusCode -ge 300 -and $response.StatusCode -lt 400 -and $response.Headers.Location) {
+                      if ($response.Headers.Location.StartsWith("http")) {
+                          $currentUri = $response.Headers.Location
+                      } else {
+                          $baseUri = [System.Uri]$currentUri
+                          $currentUri = [System.Uri]::new($baseUri, $response.Headers.Location).AbsoluteUri
+                      }
+                  } else {
+                      break
+                  }
+              }
+              Invoke-WebRequest -Uri $currentUri -OutFile $OutFile -UseBasicParsing -ErrorAction Stop
+          }
+
+          Invoke-WebRequestFollowRedirects -Uri $url -OutFile $outputPath
+          Write-Output "Windows Server 2025 ISO downloaded to $outputPath"
+
+      - name: Create and start VM
+        shell: powershell
+        id: vm
+        run: |
+          if (-not (Test-Path (Split-Path $env:VM_DISK))) {
+            New-Item -ItemType Directory -Force -Path (Split-Path $env:VM_DISK)
+          }
+          New-VHD -Path $env:VM_DISK -SizeBytes $env:VM_DISK_SIZE_BYTES -Dynamic
+          New-VM -Name $env:VM_NAME -MemoryStartupBytes $env:VM_RAM -Generation 2 -NewVHDPath $env:VM_DISK
+          Set-VMProcessor -VMName $env:VM_NAME -Count $env:VM_CPU_COUNT
+          Add-VMDvdDrive -VMName $env:VM_NAME -Path $env:VM_OS_ISO
+          Set-VMFirmware -VMName $env:VM_NAME -BootOrder (Get-VMFirmware -VMName $env:VM_NAME).BootOrder | Where-Object { $_.Device -eq "CD" }
+          Start-VM -Name $env:VM_NAME
+
+          Write-Host "VM started, waiting 15 minutes for installation"
+          Start-Sleep -Seconds 900
+
+          $rdpUser = "rdpuser"
+          $rdpPass = [System.Web.Security.Membership]::GeneratePassword(16,3)
+
+          Invoke-Command -VMName $env:VM_NAME -ScriptBlock {
+            param($rdpUser, $rdpPass, $tailscaleAuthKey)
+
+            New-LocalUser -Name $rdpUser -Password (ConvertTo-SecureString $rdpPass -AsPlainText -Force) -FullName "RDP User" -Description "User for RDP Access"
+            Add-LocalGroupMember -Group "Administrators" -Member $rdpUser
+
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+            Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+            Invoke-WebRequest -Uri "https://tailscale.com/install.ps1" -UseBasicParsing | Invoke-Expression
+            tailscale up --authkey=$tailscaleAuthKey --accept-routes
+
+            Start-Sleep -Seconds 20
+            $tailscaleIP = tailscale ip -4
+            Write-Output "Tailscale IP: $tailscaleIP"
+
+            [PSCustomObject]@{
+              IP = $tailscaleIP
+              User = $rdpUser
+              Password = $rdpPass
+            } | ConvertTo-Json
+          } -ArgumentList $rdpUser, $rdpPass, $env:TAILSCALE_AUTHKEY -OutVariable outputResult
+
+          $resultJson = $outputResult[-1]
+          Write-Host "RDP și Tailscale Info: $resultJson"
+          $obj = $resultJson | ConvertFrom-Json
+          Write-Output "::set-output name=TAILSCALE_IP::$($obj.IP)"
+          Write-Output "::set-output name=RDP_USER::$($obj.User)"
+          Write-Output "::set-output name=RDP_PASS::$($obj.Password)"
+
+      - name: Run VM for 6 hours
+        shell: powershell
+        run: |
+          Write-Host "Running VM for 6 hours"
+          Start-Sleep -Seconds 21600
+
+      - name: Stop VM
+        shell: powershell
+        run: |
+          Stop-VM -Name $env:VM_NAME -Force
+          Write-Host "VM stopped."
+
+      - name: Output connection info
+        run: |
+          echo "Tailscale IP: ${{ steps.vm.outputs.TAILSCALE_IP }}"
+          echo "RDP Username: ${{ steps.vm.outputs.RDP_USER }}"
+          echo "RDP Password: ${{ steps.vm.outputs.RDP_PASS }}"
+          
