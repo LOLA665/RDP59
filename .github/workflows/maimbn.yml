@@ -1,0 +1,130 @@
+name: Windows11 VM with Tailscale and RDP Access
+
+on: [push]
+
+env:
+  VM_NAME: Win11-Tailscale-RDP
+  VM_RAM: 64GB
+  VM_DISK: C:\HyperV\VirtualHardDisks\Win11-Tailscale-RDP.vhdx
+  VM_DISK_SIZE_BYTES: 1TB
+  VM_CPU_COUNT: 8
+  VM_OS_ISO: C:\temp\Win11_22H2_x64.iso
+  TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+jobs:
+  create-vm-and-configure:
+    runs-on: windows-latest
+    steps:
+      - name: Download Windows 11 ISO with redirect handling
+        shell: powershell
+        run: |
+          $url = "https://software-download.microsoft.com/db/Win11_22H2_English_x64v1.iso"
+          $outputPath = "C:\temp\Win11_22H2_x64.iso"
+
+          function Invoke-WebRequestFollowRedirects {
+              param(
+                  [string]$Uri,
+                  [string]$OutFile,
+                  [int]$MaximumRedirection = 10
+              )
+              $currentUri = $Uri
+              for ($i=0; $i -lt $MaximumRedirection; $i++) {
+                  $response = Invoke-WebRequest -Uri $currentUri -Method Head -MaximumRedirection 0 -ErrorAction Stop
+                  if ($response.StatusCode -ge 300 -and $response.StatusCode -lt 400 -and $response.Headers.Location) {
+                      if ($response.Headers.Location.StartsWith("http")) {
+                          $currentUri = $response.Headers.Location
+                      } else {
+                          $baseUri = [System.Uri]$currentUri
+                          $currentUri = [System.Uri]::new($baseUri, $response.Headers.Location).AbsoluteUri
+                      }
+                  } else {
+                      break
+                  }
+              }
+              Invoke-WebRequest -Uri $currentUri -OutFile $OutFile -UseBasicParsing -ErrorAction Stop
+          }
+
+          Invoke-WebRequestFollowRedirects -Uri $url -OutFile $outputPath
+          Write-Output "ISO downloaded to $outputPath"
+
+      - name: Create and start VM
+        shell: powershell
+        id: vm
+        run: |
+          # Creează folder pentru HDD virtual dacă lipsește
+          if (-not (Test-Path (Split-Path $env:VM_DISK))) {
+            New-Item -ItemType Directory -Force -Path (Split-Path $env:VM_DISK)
+          }
+          New-VHD -Path $env:VM_DISK -SizeBytes $env:VM_DISK_SIZE_BYTES -Dynamic
+          New-VM -Name $env:VM_NAME -MemoryStartupBytes $env:VM_RAM -Generation 2 -NewVHDPath $env:VM_DISK
+          Set-VMProcessor -VMName $env:VM_NAME -Count $env:VM_CPU_COUNT
+          Add-VMDvdDrive -VMName $env:VM_NAME -Path $env:VM_OS_ISO
+          Set-VMFirmware -VMName $env:VM_NAME -BootOrder (Get-VMFirmware -VMName $env:VM_NAME).BootOrder | Where-Object { $_.Device -eq "CD" }
+
+          # Pornește VM
+          Start-VM -Name $env:VM_NAME
+          Write-Host "VM started, așteaptă 15 minute pentru instalare Windows sau unattended setup"
+          Start-Sleep -Seconds 900
+
+          # Generează parola random RDP și user
+          $rdpUser = "rdpuser"
+          $rdpPass = [System.Web.Security.Membership]::GeneratePassword(16,3)
+
+          # Configurare în VM: user RDP, activează RDP, firewall, Tailscale
+          Invoke-Command -VMName $env:VM_NAME -ScriptBlock {
+            param($rdpUser, $rdpPass, $tailscaleAuthKey)
+
+            # Creare user RDP
+            New-LocalUser -Name $rdpUser -Password (ConvertTo-SecureString $rdpPass -AsPlainText -Force) -FullName "RDP User" -Description "RDP User account"
+            Add-LocalGroupMember -Group "Administrators" -Member $rdpUser
+
+            # Activează Remote Desktop
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+
+            # Setează firewall pe Remote Desktop
+            Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+            # Instalează și configurează Tailscale
+            Invoke-WebRequest -Uri "https://tailscale.com/install.ps1" -UseBasicParsing | Invoke-Expression
+            tailscale up --authkey=$tailscaleAuthKey --accept-routes
+
+            Start-Sleep -Seconds 20 # Așteaptă conectare Tailscale
+
+            # Obține IP Tailscale
+            $tailscaleIP = tailscale ip -4
+            Write-Output "Tailscale IP: $tailscaleIP"
+
+            # Returnează detalii
+            [PSCustomObject]@{
+              IP = $tailscaleIP
+              User = $rdpUser
+              Password = $rdpPass
+            } | ConvertTo-Json
+          } -ArgumentList $rdpUser, $rdpPass, $env:TAILSCALE_AUTHKEY -OutVariable OutResult
+
+          # Parsează output și setează pentru pași următori
+          $resultJson = $OutResult[-1]
+          Write-Host "RDP și Tailscale Info: $resultJson"
+          $obj = $resultJson | ConvertFrom-Json
+          Write-Output "::set-output name=TAILSCALE_IP::$($obj.IP)"
+          Write-Output "::set-output name=RDP_USER::$($obj.User)"
+          Write-Output "::set-output name=RDP_PASS::$($obj.Password)"
+
+      - name: Run VM for 6 hours
+        shell: powershell
+        run: |
+          Write-Host "Rulează VM 6 ore"
+          Start-Sleep -Seconds 21600
+
+      - name: Stop VM
+        shell: powershell
+        run: |
+          Stop-VM -Name $env:VM_NAME -Force
+          Write-Host "VM oprit."
+
+      - name: Output connection info
+        run: |
+          echo "Tailscale IP: ${{ steps.vm.outputs.TAILSCALE_IP }}"
+          echo "RDP Username: ${{ steps.vm.outputs.RDP_USER }}"
+          echo "RDP Password: ${{ steps.vm.outputs.RDP_PASS }}"
+          
