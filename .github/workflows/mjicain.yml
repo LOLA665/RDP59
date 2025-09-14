@@ -1,0 +1,70 @@
+name: Windows 11 VM with RustDesk and Tailscale
+
+on: [push]
+
+env:
+  VM_NAME: Win11-6oee
+  VM_RAM: 64GB
+  VM_DISK_PATH: C:\HyperV\VirtualHardDisks\Win11-6oee.vhdx
+  VM_DISK_SIZE: 1TB
+  VM_CPU_COUNT: 8
+  VM_ISO_PATH: C:\temp\Win11_22H2_x64.iso
+  TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+  RUSTDESK_PASSWORD: ParolaTare123!
+
+jobs:
+  build-and-run:
+    runs-on: windows-latest
+
+    steps:
+    - name: Download Windows 11 ISO with curl
+      shell: powershell
+      run: |
+        $url = "https://software-download.microsoft.com/db/Win11_22H2_English_x64v1.iso"
+        $isoPath = "$env:VM_ISO_PATH"
+        curl -L -o $isoPath $url
+        Write-Output "ISO downloaded to $isoPath"
+
+    - name: Setup and Run VM
+      shell: powershell
+      run: |
+        if (-not (Test-Path (Split-Path $env:VM_DISK_PATH))) {
+          New-Item -ItemType Directory -Force -Path (Split-Path $env:VM_DISK_PATH)
+        }
+        New-VHD -Path $env:VM_DISK_PATH -SizeBytes $env:VM_DISK_SIZE -Dynamic
+        New-VM -Name $env:VM_NAME -MemoryStartupBytes $env:VM_RAM -Generation 2 -NewVHDPath $env:VM_DISK_PATH
+        Set-VMProcessor -VMName $env:VM_NAME -Count $env:VM_CPU_COUNT
+        Add-VMDvdDrive -VMName $env:VM_NAME -Path $env:VM_ISO_PATH
+        Set-VMFirmware -VMName $env:VM_NAME -BootOrder (Get-VMFirmware -VMName $env:VM_NAME).BootOrder | Where-Object { $_.Device -eq "CD" }
+        Start-VM -Name $env:VM_NAME
+
+        Write-Output "VM started. Switching to 10 minutes wait to simulate OS install/unattended setup."
+        Start-Sleep -Seconds 600
+
+        Invoke-Command -VMName $env:VM_NAME -ScriptBlock {
+          Invoke-WebRequest -Uri "https://tailscale.com/install.ps1" -UseBasicParsing | Invoke-Expression
+          tailscale up --authkey="${using:TAILSCALE_AUTHKEY}" --accept-routes
+
+          Start-Process powershell -ArgumentList "winget install --id RustDesk.RustDesk -e -h" -Wait
+
+          Start-Sleep -Seconds 10
+          $configPath = "$Env:APPDATA\RustDesk\rustdesk.conf"
+          if (Test-Path $configPath) {
+            $content = Get-Content $configPath -Raw
+            $content = $content -replace '"password":".*?"', '"password":"'"${using:RUSTDESK_PASSWORD}"'"'
+            Set-Content -Path $configPath -Value $content
+          }
+
+          Start-Process "C:\Program Files\RustDesk\rustdesk.exe"
+
+          Start-Sleep -Seconds 15
+          $id = & "C:\Program Files\RustDesk\rustdesk.exe" --print-id
+          Write-Output "RustDesk ID: $id"
+        }
+
+        Write-Output "Running VM for 6 hours..."
+        Start-Sleep -Seconds 21600
+
+        Stop-VM -Name $env:VM_NAME -Force
+        Write-Output "VM stopped after 6 hours."
+        
