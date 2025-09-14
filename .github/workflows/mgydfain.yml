@@ -1,0 +1,110 @@
+name: Windows11 VM with Tailscale and RDP Access
+
+on: [push]
+
+env:
+  VM_NAME: Win11-Tailscale-RDP
+  VM_RAM: 64GB
+  VM_DISK: C:\HyperV\VirtualHardDisks\Win11-Tailscale-RDP.vhdx
+  VM_DISK_SIZE_BYTES: 1TB
+  VM_CPU_COUNT: 8
+  VM_OS_ISO: C:\temp\Win11_22H2_x64.iso
+  TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+jobs:
+  create-vm-and-configure:
+    runs-on: windows-latest
+    steps:
+      - name: Download Windows 11 ISO (curl for avoiding 400 errors)
+        shell: powershell
+        run: |
+          $url = "https://software-download.microsoft.com/db/Win11_22H2_English_x64v1.iso"
+          $isoPath = "$env:VM_OS_ISO"
+          curl -L -o $isoPath $url
+          Write-Host "Windows 11 ISO downloaded to $isoPath"
+      
+      - name: Create and start VM
+        shell: powershell
+        id: vm
+        run: |
+          # Creare folder disc dacă nu există
+          if (-not (Test-Path (Split-Path $env:VM_DISK))) {
+            New-Item -ItemType Directory -Force -Path (Split-Path $env:VM_DISK)
+          }
+          # Crearea discului virtual
+          New-VHD -Path $env:VM_DISK -SizeBytes $env:VM_DISK_SIZE_BYTES -Dynamic
+
+          # Creare VM Gen 2, setări hardware
+          New-VM -Name $env:VM_NAME -MemoryStartupBytes $env:VM_RAM -Generation 2 -NewVHDPath $env:VM_DISK
+          Set-VMProcessor -VMName $env:VM_NAME -Count $env:VM_CPU_COUNT
+          Add-VMDvdDrive -VMName $env:VM_NAME -Path $env:VM_OS_ISO
+          Set-VMFirmware -VMName $env:VM_NAME -BootOrder (Get-VMFirmware -VMName $env:VM_NAME).BootOrder | Where-Object { $_.Device -eq "CD" }
+
+          # Pornire VM
+          Start-VM -Name $env:VM_NAME
+          Write-Host "VM started, waiting 15 min for Windows install"
+          Start-Sleep -Seconds 900
+
+          # Generare parola RDP random + creare user pe VM + configurare RDP
+          $rdpPass = [System.Web.Security.Membership]::GeneratePassword(16,3)
+          $rdpUser = "rdpuser"
+
+          Invoke-Command -VMName $env:VM_NAME -ScriptBlock {
+            param($rdpUser, $rdpPass)
+            # Creare user
+            New-LocalUser -Name $rdpUser -Password (ConvertTo-SecureString $rdpPass -AsPlainText -Force) -FullName "RDP User" -Description "User for RDP Access"
+            Add-LocalGroupMember -Group "Administrators" -Member $rdpUser
+
+            # Activatează Remote Desktop
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\' -Name "fDenyTSConnections" -Value 0
+
+            # Dezactivează Firewall pe RDP (alternativ configurare firewall doar pe port 3389)
+            Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+            # Instalează și configurează Tailscale
+            Invoke-WebRequest -Uri "https://tailscale.com/install.ps1" -UseBasicParsing | Invoke-Expression
+            tailscale up --authkey=$using:TAILSCALE_AUTHKEY --accept-routes
+
+            # Așteaptă conectare completă Tailscale
+            Start-Sleep -Seconds 20
+
+            # Returnează IP-ul Tailscale
+            $tailscaleIP = tailscale ip -4
+            Write-Output "Tailscale IP: $tailscaleIP"
+
+            # Trimite info în output
+            [PSCustomObject]@{
+              IP = $tailscaleIP
+              User = $rdpUser
+              Password = $rdpPass
+            } | ConvertTo-Json
+          } -ArgumentList $rdpUser, $rdpPass -ErrorAction Stop -OutVariable results
+
+          # Salvează json output în fișier temporar
+          $resultsStr = $results[-1] # ultimul output script block
+          Write-Host "RDP and Tailscale Info: $resultsStr"
+
+          # Parsează output json și populează ca output step
+          $data = $resultsStr | ConvertFrom-Json
+          Write-Output "::set-output name=TAILSCALE_IP::$($data.IP)"
+          Write-Output "::set-output name=RDP_USER::$($data.User)"
+          Write-Output "::set-output name=RDP_PASS::$($data.Password)"
+          
+      - name: Run VM for 6 hours
+        shell: powershell
+        run: |
+          Write-Host "VM will run for 6 hours"
+          Start-Sleep -Seconds 21600
+
+      - name: Stop VM
+        shell: powershell
+        run: |
+          Stop-VM -Name $env:VM_NAME -Force
+          Write-Host "VM stopped."
+
+      - name: Output connection details
+        run: |
+          echo "Tailscale IP: ${{ steps.vm.outputs.TAILSCALE_IP }}"
+          echo "RDP Username: ${{ steps.vm.outputs.RDP_USER }}"
+          echo "RDP Password: ${{ steps.vm.outputs.RDP_PASS }}"
+          
