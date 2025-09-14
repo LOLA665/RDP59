@@ -1,0 +1,74 @@
+name: Windows 11 VM with RustDesk and Tailscale
+
+on: [push]
+
+jobs:
+  build-run-vm:
+    runs-on: windows-latest
+
+    steps:
+    - name: Download Windows 11 22H2 ISO
+      shell: powershell
+      run: |
+        $outputPath = "C:\temp\Win11_22H2_x64.iso"
+        $url = "https://software-download.microsoft.com/db/Win11_22H2_English_x64v1.iso"
+        curl -L $url -o $outputPath
+        Write-Output "ISO downloaded to $outputPath"
+
+    - name: Create and start VM
+      shell: powershell
+      run: |
+        $vmName = "Win11-6oee"
+        $vmMem = 64GB
+        $vmDisk = "C:\HyperV\VirtualHardDisks\$vmName.vhdx"
+        $vmDiskSize = 1TB
+        $vmIso = "C:\temp\Win11_22H2_x64.iso"
+        $vmCpuCount = 8
+
+        if (-not (Test-Path (Split-Path $vmDisk))) {
+            New-Item -ItemType Directory -Force -Path (Split-Path $vmDisk)
+        }
+        New-VHD -Path $vmDisk -SizeBytes $vmDiskSize -Dynamic
+        New-VM -Name $vmName -MemoryStartupBytes $vmMem -Generation 2 -NewVHDPath $vmDisk
+        Set-VMProcessor -VMName $vmName -Count $vmCpuCount
+        Add-VMDvdDrive -VMName $vmName -Path $vmIso
+        Set-VMFirmware -VMName $vmName -BootOrder (Get-VMFirmware -VMName $vmName).BootOrder | Where-Object { $_.Device -eq "CD" }
+        Start-VM -Name $vmName
+
+        Write-Output "VM started, please wait 10 minutes for Windows installation..."
+        Start-Sleep -Seconds 600
+
+        Invoke-Command -VMName $vmName -ScriptBlock {
+          # Instalează Tailscale
+          Invoke-WebRequest -Uri "https://tailscale.com/install.ps1" -UseBasicParsing | Invoke-Expression
+
+          # Configurează Tailscale cu auth key din secretul GitHub
+          $authkey = '${{ secrets.TAILSCALE_AUTHKEY }}'
+          tailscale up --authkey=$authkey --accept-routes
+
+          # Instalează RustDesk
+          Start-Process -FilePath "powershell.exe" -ArgumentList "winget install --id RustDesk.RustDesk -e -h" -Wait
+
+          # Configurează parola permanentă RustDesk în fișier config
+          $configPath = "$env:APPDATA\RustDesk\rustdesk.conf"
+          Start-Sleep -Seconds 10
+          if (Test-Path $configPath) {
+              $confText = Get-Content $configPath -Raw
+              $newText = $confText -replace '"password":".*?"', '"password":"ParolaTare123"'
+              Set-Content -Path $configPath -Value $newText
+          }
+
+          # Pornește RustDesk
+          Start-Process "C:\Program Files\RustDesk\rustdesk.exe"
+
+          # Afișează ID-ul RustDesk în loguri
+          Start-Sleep -Seconds 15
+          $idOutput = & "C:\Program Files\RustDesk\rustdesk.exe" --print-id
+          Write-Output "RustDesk ID: $idOutput"
+        }
+
+        Write-Output "VM will run for 6 hours"
+        Start-Sleep -Seconds 21600
+        Stop-VM -Name $vmName -Force
+        Write-Output "VM stopped after 6 hours."
+        
